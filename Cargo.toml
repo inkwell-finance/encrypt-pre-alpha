@@ -33,6 +33,8 @@ members = [
     "chains/solana/examples/acl/anchor",
     "chains/solana/examples/pc-token/pinocchio",
     "chains/solana/examples/pc-swap/pinocchio",
+    "chains/solana/examples/dagon-points-pool/pinocchio",
+    "chains/solana/examples/pc-token-cold/pinocchio",
     "chains/solana/examples/vector-ops/pinocchio",
     "chains/solana/examples/coin-flip/pinocchio",
     "chains/solana/examples/coin-flip/native",
