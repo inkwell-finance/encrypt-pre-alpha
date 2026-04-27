@@ -296,7 +296,11 @@ impl<'a> EncryptContext<'a> {
 
         let accounts = [
             InstructionAccount { address: source_ciphertext.address(), is_writable: false, is_signer: false },
-            InstructionAccount { address: new_ciphertext.address(), is_writable: true, is_signer: false },
+            // new_ciphertext is a fresh keypair the caller signs with — Encrypt creates the
+            // account via System::CreateAccount which requires it as signer.
+            // Inkwell fork: upstream had `is_signer: false` here which produced "signer privilege
+            // escalated" inside Encrypt's nested System::CreateAccount call.
+            InstructionAccount { address: new_ciphertext.address(), is_writable: true, is_signer: true },
             InstructionAccount { address: self.caller_program.address(), is_writable: false, is_signer: false },
             InstructionAccount { address: self.cpi_authority.address(), is_writable: false, is_signer: true },
             InstructionAccount { address: new_authorized.address(), is_writable: false, is_signer: false },
