@@ -19,6 +19,9 @@
 /// 3. RequestDecrypt — decrypt any pool-owned ciphertext
 /// 4. RemoveLiquidity — burn LP, withdraw proportional reserves (FHE enforced)
 /// 5. CreateLpPosition — create user's LP position account
+/// 10. SettleSwap — Inkwell fork; chains pool-leg swap + copy_ciphertext × 2 to expose
+///                  amount_in/out as PC-Token-authorized ciphertexts. Paired with
+///                  PC-Token::settle_user_leg in the same TX for atomic user balance updates.
 use encrypt_dsl::prelude::encrypt_fn;
 use encrypt_pinocchio::EncryptContext;
 use encrypt_types::encrypted::{EUint128, Uint128};
@@ -184,6 +187,8 @@ fn process_instruction(
         Some((&2, rest)) => add_liquidity(accounts, rest),
         Some((&4, rest)) => remove_liquidity(accounts, rest),
         Some((&5, rest)) => create_lp_position(program_id, accounts, rest),
+        // 10: SettleSwap — Inkwell fork addition. See `settle_swap` doc.
+        Some((&10, rest)) => settle_swap(accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -366,6 +371,75 @@ fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         ra_ct, rb_ct, ts_ct, burn_ct, user_lp_ct,
         out_a_ct, out_b_ct, ra_ct, rb_ct, ts_ct, user_lp_ct,
     )?;
+    Ok(())
+}
+
+// ── 10: SettleSwap (Inkwell fork) ──
+//
+// Atomic on-chain settle path. Runs the standard pool-leg swap_graph (same maths as `swap`),
+// then copy_ciphertexts both `amount_in` and `amount_out` to a caller-provided `new_authorized`
+// pubkey — typically PC-Token's CPI authority PDA. The next instruction in the TX is expected
+// to be PC-Token::settle_user_leg (discriminator 50), which consumes the copies, debits the
+// signer's input balance, and credits the output balance.
+//
+// Splitting the user-leg into a separate top-level instruction (vs. CPI'ing directly) lets
+// PC-Token verify provenance via the Solana instructions sysvar — see PC-Token's
+// `TRUSTED_PC_SWAP_ID` and the doc on `settle_user_leg` for the security model.
+//
+// Account layout (positions matter — PC-Token verifies the copies appear in this ix's account
+// list):
+//   [0]  pool_acct
+//   [1]  rin_ct          (writable: graph rewrites reserve_in)
+//   [2]  rout_ct         (writable: graph rewrites reserve_out)
+//   [3]  amt_in_ct       (read-only input)
+//   [4]  min_out_ct      (read-only input)
+//   [5]  amt_out_ct      (writable: graph writes amount_out)
+//   [6]  price_ct        (writable: graph writes new price)
+//   [7]  amt_in_copy     (signer + writable: fresh keypair, becomes a new PC-Token-auth CT)
+//   [8]  amt_out_copy    (signer + writable: same)
+//   [9]  new_authorized  (read-only; client passes PC-Token's CPI authority PDA here)
+//   [10] encrypt_program
+//   [11] config
+//   [12] deposit
+//   [13] cpi_authority   (PC-Swap's own)
+//   [14] caller_program  (PC-Swap, self)
+//   [15] network_encryption_key
+//   [16] payer (signer)
+//   [17] event_authority
+//   [18] system_program
+//
+// Data: [10 (disc), cpi_bump, direction]
+fn settle_swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [pool_acct, rin_ct, rout_ct, amt_in_ct, min_out_ct, amt_out_ct, price_ct,
+         amt_in_copy, amt_out_copy, new_authorized,
+         encrypt_program, config, deposit, cpi_authority, caller_program,
+         network_encryption_key, payer, event_authority, system_program, ..] = accounts
+    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+    if data.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
+    let (cpi_bump, direction) = (data[0], data[1]);
+
+    let pd = unsafe { pool_acct.borrow_unchecked() };
+    let pool = Pool::from_bytes(pd)?;
+    if pool.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
+    let (ein, eout) = if direction == 0 { (&pool.reserve_a, &pool.reserve_b) }
+        else { (&pool.reserve_b, &pool.reserve_a) };
+    if rin_ct.address().as_ref() != ein { return Err(ProgramError::InvalidArgument); }
+    if rout_ct.address().as_ref() != eout { return Err(ProgramError::InvalidArgument); }
+    if price_ct.address().as_ref() != &pool.price_ct { return Err(ProgramError::InvalidArgument); }
+
+    let ctx = EncryptContext { encrypt_program, config, deposit, cpi_authority, caller_program,
+        network_encryption_key, payer, event_authority, system_program, cpi_authority_bump: cpi_bump };
+
+    // Pool-leg: same as ordinary swap. Updates reserves, computes amount_out, refreshes price.
+    ctx.swap_graph(rin_ct, rout_ct, amt_in_ct, min_out_ct, price_ct,
+        amt_out_ct, rin_ct, rout_ct, price_ct)?;
+
+    // Re-authorize amount_in and amount_out to PC-Token's CPI authority. The user-leg picks
+    // these up as graph inputs in the next instruction.
+    ctx.copy_ciphertext(amt_in_ct, amt_in_copy, new_authorized)?;
+    ctx.copy_ciphertext(amt_out_ct, amt_out_copy, new_authorized)?;
+
     Ok(())
 }
 

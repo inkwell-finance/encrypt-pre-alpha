@@ -12,6 +12,18 @@
 /// are wrap/unwrap amounts at the SPL boundary, and those live on
 /// temporary WithdrawalReceipt accounts that get closed immediately.
 ///
+/// ## Inkwell fork: type-widened to EUint128
+///
+/// Upstream uses EUint64 for balance + amount ciphertexts. This fork widens to EUint128
+/// throughout, so PC-Token ciphertexts compose with PC-Swap (also EUint128) inside a single
+/// FHE graph. Required for the dagon points-farm `settle_swap` flow which atomically debits
+/// user A and credits user B against pool reserves — without matching types, copy_ciphertext
+/// can't bridge the two programs (it re-authorizes but doesn't re-encrypt to a different fhe_type).
+///
+/// Ciphertext byte layout on-chain is unchanged (32-byte CT identifier either way). The fhe_type
+/// tag inside the executor's stored bytes flips from 4 → 5. Existing pc_accounts created under
+/// the EUint64 schema cannot be reused — re-init with a fresh authority to get fresh PDAs.
+///
 /// ## Instructions (P-Token discriminators)
 ///
 ///  0. InitializeMint
@@ -33,11 +45,12 @@
 use encrypt_dsl::prelude::encrypt_fn;
 use encrypt_pinocchio::accounts;
 use encrypt_pinocchio::EncryptContext;
-use encrypt_types::encrypted::{EUint64, Uint64};
+use encrypt_types::encrypted::{EUint128, Uint128};
 use pinocchio::{
     cpi::{Seed, Signer},
     entrypoint,
     error::ProgramError,
+    sysvars::instructions::Instructions,
     AccountView, Address, ProgramResult,
 };
 use pinocchio_system::instructions::CreateAccount;
@@ -46,6 +59,25 @@ use pinocchio_token::instructions::Transfer as SplTransfer;
 entrypoint!(process_instruction);
 
 pub const ID: Address = Address::new_from_array([5u8; 32]);
+
+/// Hardcoded trusted PC-Swap program ID (Inkwell devnet deployment:
+/// `3626dVuZYNyzvfitei2L583XepkMqobWa1VJJjVpjLcy`). Used by `settle_user_leg` to verify the
+/// prior TX instruction came from the real PC-Swap, not an attacker-deployed lookalike.
+///
+/// The check matters because `amount_in_copy` and `amount_out_copy` are PC-Token-authorized
+/// ciphertexts the user passes as inputs to `settle_user_graph`. Without verifying their
+/// provenance, an attacker could create their own ciphertexts via gRPC `createInput` with
+/// arbitrary plaintexts (authorized to PC-Token's CPI authority), call `settle_user_leg`
+/// directly, and credit themselves arbitrary amounts.
+///
+/// **If you redeploy PC-Swap with a different program ID, this constant MUST be updated.**
+pub const TRUSTED_PC_SWAP_ID: Address = Address::new_from_array([
+    0x1f, 0x00, 0x84, 0xb2, 0x30, 0x01, 0x12, 0xd5, 0xdb, 0x35, 0x7d, 0x1e, 0xd5, 0xab, 0xc9, 0xbd,
+    0xa6, 0xd0, 0x10, 0x58, 0xbe, 0x03, 0xf4, 0x4b, 0x68, 0x10, 0xb3, 0xa3, 0x11, 0x9d, 0x09, 0xd2,
+]);
+
+/// Discriminator byte of the PC-Swap `settle_swap` instruction.
+const PC_SWAP_SETTLE_SWAP_DISC: u8 = 10;
 
 // ── AccountState ──
 
@@ -78,16 +110,16 @@ impl Mint {
     pub fn has_freeze_authority(&self) -> bool { self.freeze_authority_flag == COPTION_SOME }
 }
 
-/// TokenAccount — NO plaintext fields. Balance is always encrypted.
+/// TokenAccount — NO plaintext fields. Balance is always encrypted (EUint128).
 #[repr(C)]
 pub struct TokenAccount {
     pub mint: [u8; 32],
     pub owner: [u8; 32],
-    pub balance: EUint64,
+    pub balance: EUint128,
     pub delegate_flag: [u8; 4],
     pub delegate: [u8; 32],
     pub state: u8,
-    pub allowance: EUint64,
+    pub allowance: EUint128,
     pub close_authority_flag: [u8; 4],
     pub close_authority: [u8; 32],
     pub bump: u8,
@@ -131,20 +163,20 @@ fn assert_not_frozen(ta: &TokenAccount) -> ProgramResult { if ta.is_frozen() { E
 
 // ── FHE Graphs ──
 
-#[encrypt_fn] fn mint_to_graph(balance: EUint64, amount: EUint64) -> EUint64 { balance + amount }
+#[encrypt_fn] fn mint_to_graph(balance: EUint128, amount: EUint128) -> EUint128 { balance + amount }
 
-#[encrypt_fn] fn transfer_graph(from_balance: EUint64, to_balance: EUint64, amount: EUint64) -> (EUint64, EUint64) {
+#[encrypt_fn] fn transfer_graph(from_balance: EUint128, to_balance: EUint128, amount: EUint128) -> (EUint128, EUint128) {
     let s = from_balance >= amount;
     let nf = if s { from_balance - amount } else { from_balance };
     let nt = if s { to_balance + amount } else { to_balance };
     (nf, nt)
 }
 
-#[encrypt_fn] fn burn_graph(balance: EUint64, amount: EUint64) -> EUint64 {
+#[encrypt_fn] fn burn_graph(balance: EUint128, amount: EUint128) -> EUint128 {
     let s = balance >= amount; if s { balance - amount } else { balance }
 }
 
-#[encrypt_fn] fn transfer_from_graph(from_balance: EUint64, to_balance: EUint64, allowance: EUint64, amount: EUint64) -> (EUint64, EUint64, EUint64) {
+#[encrypt_fn] fn transfer_from_graph(from_balance: EUint128, to_balance: EUint128, allowance: EUint128, amount: EUint128) -> (EUint128, EUint128, EUint128) {
     let sb = from_balance >= amount; let sa = allowance >= amount; let v = sb & sa;
     let nf = if v { from_balance - amount } else { from_balance };
     let nt = if v { to_balance + amount } else { to_balance };
@@ -154,11 +186,40 @@ fn assert_not_frozen(ta: &TokenAccount) -> ProgramResult { if ta.is_frozen() { E
 
 /// Unwrap burn: conditional burn that outputs the actual burned amount.
 /// burned = amount if sufficient, 0 if not.
-#[encrypt_fn] fn unwrap_burn_graph(balance: EUint64, amount: EUint64) -> (EUint64, EUint64) {
+#[encrypt_fn] fn unwrap_burn_graph(balance: EUint128, amount: EUint128) -> (EUint128, EUint128) {
     let s = balance >= amount;
     let new_balance = if s { balance - amount } else { balance };
     let burned = if s { amount } else { amount - amount };
     (new_balance, burned)
+}
+
+/// Settle the user-leg of a PC-Swap atomic settle. amount_in/out come pre-copied to PC-Token
+/// authorization from PC-Swap's settle_swap.
+///
+/// Two no-op gates:
+///   1. user_in >= amount_in — user must have enough to pay
+///   2. amount_out >= 1 — the pool actually paid out (slippage check inside swap_graph
+///      sets amount_out=0 on failure; we mirror that to avoid debiting the user when the
+///      pool no-op'd)
+///
+/// Asymmetric-failure risk: if the pool succeeds but user_in < amount_in, the pool reserves
+/// already moved by the time we run; the user-leg no-ops, leaving the pool out-of-balance vs.
+/// the user. The client MUST check user balance before submitting a settle_swap. Pre-alpha
+/// demo accepts this; production design either keeps balance + pool authorized to one program
+/// (Path A) or adds an SDK primitive for cross-type checks.
+#[encrypt_fn] fn settle_user_graph(
+    user_in: EUint128,
+    user_out: EUint128,
+    amount_in: EUint128,
+    amount_out: EUint128,
+) -> (EUint128, EUint128) {
+    let user_has_balance = user_in >= amount_in;
+    let pool_paid = amount_out >= 1;
+    // valid = user_has_balance && pool_paid (FHE-AND via nested if)
+    let valid = if user_has_balance { pool_paid } else { user_has_balance };
+    let new_user_in = if valid { user_in - amount_in } else { user_in };
+    let new_user_out = if valid { user_out + amount_out } else { user_out };
+    (new_user_in, new_user_out)
 }
 
 // ── Dispatch ──
@@ -180,6 +241,17 @@ fn process_instruction(program_id: &Address, accounts: &[AccountView], data: &[u
         Some((&31, rest)) => unwrap_burn(program_id, accounts, rest),
         Some((&32, rest)) => unwrap_decrypt(accounts, rest),
         Some((&33, _rest)) => unwrap_complete(accounts),
+        // 40: ViewBalance — fork-only addition (Inkwell). Lets the account owner produce a
+        // wallet-authorized copy of their encrypted balance so they can read it via gRPC.
+        // Without this, balance_ct.authorized = PC-Token program → no wallet can decrypt
+        // off-chain. PR worth shipping upstream once Encrypt Alpha 1 stabilizes the read flow.
+        Some((&40, rest)) => view_balance(accounts, rest),
+        // 50: SettleUserLeg — fork-only addition (Inkwell, dagon points-farm). Atomic user-side
+        // settlement of a swap. Verifies the calling TX's prior instruction is the trusted
+        // PC-Swap settle_swap, then debits user_in_balance and credits user_out_balance from
+        // the pre-copied amount_in / amount_out ciphertexts. See `settle_user_leg` doc for
+        // the security model.
+        Some((&50, rest)) => settle_user_leg(accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -220,15 +292,15 @@ fn initialize_account(program_id: &Address, accounts: &[AccountView], data: &[u8
     let seeds = [Seed::from(b"pc_account" as &[u8]), Seed::from(mint_acct.address().as_ref()), Seed::from(owner.address().as_ref()), Seed::from(&bb)];
     CreateAccount { from: payer, to: ta_acct, lamports: minimum_balance(TokenAccount::LEN), space: TokenAccount::LEN as u64, owner: program_id }.invoke_signed(&[Signer::from(&seeds)])?;
     let ctx = EncryptContext { encrypt_program: ep, config: cfg, deposit: dep, cpi_authority: cpi_auth, caller_program: caller, network_encryption_key: nk, payer, event_authority: evt, system_program: sys, cpi_authority_bump: cb };
-    ctx.create_plaintext_typed::<Uint64>(&0u64, bal_ct)?;
+    ctx.create_plaintext_typed::<Uint128>(&0u128, bal_ct)?;
     let d = unsafe { ta_acct.borrow_unchecked_mut() };
     let ta = TokenAccount::from_bytes_mut(d)?;
     ta.mint.copy_from_slice(mint_acct.address().as_ref());
     ta.owner.copy_from_slice(owner.address().as_ref());
-    ta.balance = EUint64::from_le_bytes(*bal_ct.address().as_array());
+    ta.balance = EUint128::from_le_bytes(*bal_ct.address().as_array());
     ta.delegate_flag = COPTION_NONE; ta.delegate = [0u8; 32];
     ta.state = AccountState::Initialized as u8;
-    ta.allowance = EUint64::from_le_bytes([0u8; 32]);
+    ta.allowance = EUint128::from_le_bytes([0u8; 32]);
     ta.close_authority_flag = COPTION_NONE; ta.close_authority = [0u8; 32];
     ta.bump = ab; Ok(())
 }
@@ -289,13 +361,13 @@ fn approve(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     assert_not_frozen(ta)?;
     if owner.address().as_array() != &ta.owner { return Err(ProgramError::InvalidArgument); }
     let ctx = EncryptContext { encrypt_program: ep, config: cfg, deposit: dep, cpi_authority: cpi_auth, caller_program: caller, network_encryption_key: nk, payer: owner, event_authority: evt, system_program: sys, cpi_authority_bump: data[0] };
-    ctx.create_plaintext_typed::<Uint64>(&0u64, allow_ct)?;
+    ctx.create_plaintext_typed::<Uint128>(&0u128, allow_ct)?;
     ctx.mint_to_graph(allow_ct, amt_ct, allow_ct)?;
     let td2 = unsafe { ta_acct.borrow_unchecked_mut() };
     let ta2 = TokenAccount::from_bytes_mut(td2)?;
     ta2.delegate_flag = COPTION_SOME;
     ta2.delegate.copy_from_slice(delegate.address().as_ref());
-    ta2.allowance = EUint64::from_le_bytes(*allow_ct.address().as_array());
+    ta2.allowance = EUint128::from_le_bytes(*allow_ct.address().as_array());
     Ok(())
 }
 
@@ -315,7 +387,7 @@ fn revoke(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     ctx.close_ciphertext(allow_ct, payer)?;
     let td2 = unsafe { ta_acct.borrow_unchecked_mut() };
     let ta2 = TokenAccount::from_bytes_mut(td2)?;
-    ta2.delegate_flag = COPTION_NONE; ta2.delegate = [0u8; 32]; ta2.allowance = EUint64::from_le_bytes([0u8; 32]); Ok(())
+    ta2.delegate_flag = COPTION_NONE; ta2.delegate = [0u8; 32]; ta2.allowance = EUint128::from_le_bytes([0u8; 32]); Ok(())
 }
 
 // ── 8: Burn ──
@@ -502,7 +574,10 @@ fn unwrap_complete(accounts: &[AccountView]) -> ProgramResult {
     let digest = r.pending_digest;
 
     let req_data = unsafe { req_acct.borrow_unchecked() };
-    let burned: &u64 = accounts::read_decrypted_verified::<Uint64>(req_data, &digest)?;
+    // EUint128 fork: decrypted value is u128. Compare against the u64 SPL-side `requested`
+    // by widening to u128 — no truncation risk because requested originated as a u64 from
+    // instruction data and the FHE graph only writes back `amount if sufficient else 0`.
+    let burned: &u128 = accounts::read_decrypted_verified::<Uint128>(req_data, &digest)?;
 
     // Close receipt
     let rl = receipt_acct.lamports(); receipt_acct.set_lamports(0);
@@ -510,7 +585,7 @@ fn unwrap_complete(accounts: &[AccountView]) -> ProgramResult {
     let rd2 = unsafe { receipt_acct.borrow_unchecked_mut() };
     for b in rd2.iter_mut() { *b = 0; }
 
-    if *burned != requested { return Ok(()); } // insufficient balance — no-op, receipt closed
+    if *burned != requested as u128 { return Ok(()); } // insufficient balance — no-op, receipt closed
 
     // SPL transfer: vault → user
     let vd = unsafe { vault_acct.borrow_unchecked() };
@@ -524,6 +599,146 @@ fn unwrap_complete(accounts: &[AccountView]) -> ProgramResult {
     Ok(())
 }
 
+// ── 40: ViewBalance ──
+//
+// Inkwell fork addition. Lets the account owner produce a wallet-authorized COPY of their
+// encrypted balance ciphertext so they can read it via gRPC `readCiphertext`. The original
+// balance_ct stays under PC-Token's program authority so wraps/transfers/unwraps continue
+// to work; the copy is rent-exempt and persists, but is only readable by the owner.
+//
+// Cost: ~0.0023 SOL rent per view (the new ciphertext metadata account).
+//
+// Worth shipping upstream if Encrypt's roadmap doesn't already include a wallet-side view path.
+fn view_balance(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [ta_acct, balance_ct, view_ct, new_authorized, ep, cfg, dep, cpi_auth, caller, nk, owner, evt, sys, ..] = accounts
+    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    if !owner.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
+    let cb = data[0]; // cpi_authority_bump
+
+    // Verify the caller actually owns this token account + that balance_ct points at the
+    // ciphertext we're about to copy. Same checks the wrap path does.
+    let td = unsafe { ta_acct.borrow_unchecked() };
+    let ta = TokenAccount::from_bytes(td)?;
+    if !ta.is_initialized() { return Err(ProgramError::UninitializedAccount); }
+    if owner.address().as_array() != &ta.owner { return Err(ProgramError::InvalidArgument); }
+    if balance_ct.address().as_array() != ta.balance.id() { return Err(ProgramError::InvalidArgument); }
+
+    let ctx = EncryptContext {
+        encrypt_program: ep, config: cfg, deposit: dep,
+        cpi_authority: cpi_auth, caller_program: caller,
+        network_encryption_key: nk, payer: owner,
+        event_authority: evt, system_program: sys,
+        cpi_authority_bump: cb,
+    };
+    // Privacy invariant: the view_ct must remain authorized to a key only the user controls.
+    // We pass `new_authorized` as a separate account so the client can supply an ephemeral
+    // ed25519 pubkey it generated locally — that pubkey becomes the sole reader, and only
+    // the matching private key (held in the user's session) can sign a readCiphertext
+    // request. NEVER make_public this CT; doing so leaks the balance to any chain observer.
+    ctx.copy_ciphertext(balance_ct, view_ct, new_authorized)?;
+    Ok(())
+}
+
+// ── 50: SettleUserLeg ──
+//
+// Inkwell fork addition (dagon points-farm). Atomic user-side settlement of a PC-Swap atomic
+// swap. Debits the signer's input pc_account and credits the output pc_account from
+// pre-copied amount_in / amount_out ciphertexts produced by PC-Swap's `settle_swap`.
+//
+// Account layout:
+//   [0]  user_in_acct       — signer's pc_account for the input mint (debited)
+//   [1]  user_out_acct      — signer's pc_account for the output mint (credited)
+//   [2]  balance_ct_in      — input pc_account's balance ciphertext
+//   [3]  balance_ct_out     — output pc_account's balance ciphertext
+//   [4]  amount_in_copy     — PC-Token-authorized copy of the swap's amount_in (writable: graph reads)
+//   [5]  amount_out_copy    — PC-Token-authorized copy of the swap's amount_out (writable: graph reads)
+//   [6]  encrypt_program
+//   [7]  encrypt_config
+//   [8]  encrypt_deposit
+//   [9]  cpi_authority      — PC-Token's CPI authority PDA
+//   [10] caller_program     — PC-Token (self)
+//   [11] network_key
+//   [12] owner              — signer
+//   [13] event_authority
+//   [14] system_program
+//   [15] instructions_sysvar — for prior-instruction inspection (Sysvar1nstructions...)
+//
+// Security model:
+//   1. Signer must own both pc_accounts (standard PC-Token check).
+//   2. balance_ct_in / balance_ct_out must match the pc_account's stored ciphertext PDA.
+//   3. The prior instruction in this TX must be `PC_SWAP::settle_swap` (program_id == TRUSTED_PC_SWAP_ID,
+//      data[0] == 10), and its account list must reference both amount_in_copy and amount_out_copy.
+//      Without (3) an attacker can craft fake copies authorized to PC-Token CPI authority and
+//      mint themselves arbitrary balances.
+//   4. The FHE graph itself enforces `user_in >= amount_in` — no-op if insufficient.
+//
+// Atomicity caveat: if the user-leg no-ops (insufficient balance), the pool-leg has already
+// committed. The client must check user balance BEFORE submitting. This is a residual risk
+// inherent to the chained-CPI design; see Phase 2 design notes for context.
+fn settle_user_leg(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [user_in_acct, user_out_acct, balance_ct_in, balance_ct_out, amount_in_copy, amount_out_copy, ep, cfg, dep, cpi_auth, caller, nk, owner, evt, sys, ix_sysvar_acct, ..] = accounts
+    else { return Err(ProgramError::NotEnoughAccountKeys); };
+
+    if !owner.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
+    let cb = data[0];
+
+    // ── Validate user pc_accounts ──
+    let in_d = unsafe { user_in_acct.borrow_unchecked() };
+    let in_ta = TokenAccount::from_bytes(in_d)?;
+    if !in_ta.is_initialized() { return Err(ProgramError::UninitializedAccount); }
+    assert_not_frozen(in_ta)?;
+    if owner.address().as_array() != &in_ta.owner { return Err(ProgramError::InvalidArgument); }
+    if balance_ct_in.address().as_array() != in_ta.balance.id() { return Err(ProgramError::InvalidArgument); }
+
+    let out_d = unsafe { user_out_acct.borrow_unchecked() };
+    let out_ta = TokenAccount::from_bytes(out_d)?;
+    if !out_ta.is_initialized() { return Err(ProgramError::UninitializedAccount); }
+    assert_not_frozen(out_ta)?;
+    if owner.address().as_array() != &out_ta.owner { return Err(ProgramError::InvalidArgument); }
+    if balance_ct_out.address().as_array() != out_ta.balance.id() { return Err(ProgramError::InvalidArgument); }
+    // Must be a real swap (different mints) — same-mint settle would be a transfer, not a swap.
+    if in_ta.mint == out_ta.mint { return Err(ProgramError::InvalidArgument); }
+
+    // ── Verify prior instruction: PC-Swap settle_swap with these copies ──
+    let ix_view = Instructions::try_from(ix_sysvar_acct)?;
+    let prior = ix_view.get_instruction_relative(-1)?;
+    if prior.get_program_id() != &TRUSTED_PC_SWAP_ID {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let prior_data = prior.get_instruction_data();
+    if prior_data.is_empty() || prior_data[0] != PC_SWAP_SETTLE_SWAP_DISC {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let prior_n = prior.num_account_metas();
+    let mut found_in = false;
+    let mut found_out = false;
+    for i in 0..prior_n {
+        let acct = prior.get_instruction_account_at(i)?;
+        if acct.key.as_ref() == amount_in_copy.address().as_ref() { found_in = true; }
+        if acct.key.as_ref() == amount_out_copy.address().as_ref() { found_out = true; }
+    }
+    if !found_in || !found_out {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // ── Run user-leg graph: debit user_in, credit user_out ──
+    let ctx = EncryptContext {
+        encrypt_program: ep, config: cfg, deposit: dep,
+        cpi_authority: cpi_auth, caller_program: caller,
+        network_encryption_key: nk, payer: owner,
+        event_authority: evt, system_program: sys,
+        cpi_authority_bump: cb,
+    };
+    // settle_user_graph(user_in, user_out, amount_in, amount_out) → (new_user_in, new_user_out)
+    ctx.settle_user_graph(
+        balance_ct_in, balance_ct_out, amount_in_copy, amount_out_copy,
+        balance_ct_in, balance_ct_out,
+    )?;
+    Ok(())
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -531,7 +746,7 @@ mod tests {
     use encrypt_types::graph::{get_node, parse_graph, GraphNodeKind};
     use encrypt_types::identifier::*;
     use encrypt_types::types::FheType;
-    use super::{burn_graph, mint_to_graph, transfer_from_graph, transfer_graph, unwrap_burn_graph};
+    use super::{burn_graph, mint_to_graph, settle_user_graph, transfer_from_graph, transfer_graph, unwrap_burn_graph};
 
     fn run_mock(graph_fn: fn() -> Vec<u8>, inputs: &[u128], fhe_types: &[FheType]) -> Vec<u128> {
         let data = graph_fn(); let pg = parse_graph(&data).unwrap();
@@ -539,7 +754,7 @@ mod tests {
         let mut digests: Vec<[u8; 32]> = Vec::with_capacity(num); let mut inp = 0usize;
         for i in 0..num {
             let n = get_node(pg.node_bytes(), i as u16).unwrap();
-            let ft = FheType::from_u8(n.fhe_type()).unwrap_or(FheType::EUint64);
+            let ft = FheType::from_u8(n.fhe_type()).unwrap_or(FheType::EUint128);
             let d = match n.kind() {
                 k if k == GraphNodeKind::Input as u8 => { let v = inputs[inp]; let t = fhe_types[inp]; inp += 1; encode_mock_digest(t, v) }
                 k if k == GraphNodeKind::Constant as u8 => { let bw = ft.byte_width().min(16); let off = n.const_offset() as usize;
@@ -556,7 +771,7 @@ mod tests {
             .map(|i| decode_mock_identifier(&digests[i])).collect()
     }
 
-    const T: FheType = FheType::EUint64;
+    const T: FheType = FheType::EUint128;
 
     #[test] fn mint_to() { let r = run_mock(mint_to_graph, &[500, 300], &[T, T]); assert_eq!(r[0], 800); }
     #[test] fn transfer_ok() { let r = run_mock(transfer_graph, &[1000, 500, 300], &[T, T, T]); assert_eq!(r[0], 700); assert_eq!(r[1], 800); }
@@ -569,10 +784,33 @@ mod tests {
     #[test] fn unwrap_burn_sufficient() { let r = run_mock(unwrap_burn_graph, &[1000, 300], &[T, T]); assert_eq!(r[0], 700); assert_eq!(r[1], 300); }
     #[test] fn unwrap_burn_insufficient() { let r = run_mock(unwrap_burn_graph, &[100, 300], &[T, T]); assert_eq!(r[0], 100); assert_eq!(r[1], 0); }
 
+    #[test] fn settle_user_sufficient() {
+        // user_in=1000 USDC base, user_out=0 SOL, amount_in=300, amount_out=2 (SOL base units)
+        let r = run_mock(settle_user_graph, &[1000, 0, 300, 2], &[T, T, T, T]);
+        assert_eq!(r[0], 700, "user_in debited");
+        assert_eq!(r[1], 2, "user_out credited");
+    }
+    #[test] fn settle_user_insufficient() {
+        // user_in=100, amount_in=300 → no-op (user can't afford)
+        let r = run_mock(settle_user_graph, &[100, 50, 300, 2], &[T, T, T, T]);
+        assert_eq!(r[0], 100, "user_in unchanged");
+        assert_eq!(r[1], 50, "user_out unchanged");
+    }
+    #[test] fn settle_user_pool_no_op() {
+        // user_in=1000 (sufficient), amount_in=300, amount_out=0 (pool slippage no-op).
+        // Must NOT debit user — debiting without crediting is the asymmetric failure mode.
+        let r = run_mock(settle_user_graph, &[1000, 50, 300, 0], &[T, T, T, T]);
+        assert_eq!(r[0], 1000, "user_in unchanged when pool no-op'd");
+        assert_eq!(r[1], 50, "user_out unchanged when pool no-op'd");
+    }
+
     #[test] fn graph_shapes() {
-        let g = swap_shapes(mint_to_graph, 2, 1); let g = swap_shapes(transfer_graph, 3, 2);
-        let g = swap_shapes(burn_graph, 2, 1); let g = swap_shapes(transfer_from_graph, 4, 3);
-        let g = swap_shapes(unwrap_burn_graph, 2, 2);
+        swap_shapes(mint_to_graph, 2, 1);
+        swap_shapes(transfer_graph, 3, 2);
+        swap_shapes(burn_graph, 2, 1);
+        swap_shapes(transfer_from_graph, 4, 3);
+        swap_shapes(unwrap_burn_graph, 2, 2);
+        swap_shapes(settle_user_graph, 4, 2);
     }
     fn swap_shapes(f: fn() -> Vec<u8>, ni: u8, no: u8) { let g = f(); let pg = parse_graph(&g).unwrap();
         assert_eq!(pg.header().num_inputs(), ni); assert_eq!(pg.header().num_outputs(), no); }
