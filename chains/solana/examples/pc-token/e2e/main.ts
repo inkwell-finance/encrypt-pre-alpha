@@ -40,13 +40,15 @@ async function doUnwrap(
 ) {
   log(label, `Unwrap burn ${Number(amount)/1e6} pcUSDC...`);
   const amountCt = await enc(grpc, amount, nk);
-  const burnedCt = await enc(grpc, 0n, nk);
+  // Epoch 2: burnedCt is a fresh keypair the program creates (not createInput).
+  const burnedKp = Keypair.generate();
+  const burnedCt = burnedKp.publicKey;
   const [receiptPda, receiptBump] = deriveReceiptPda(TP, burnedCt);
 
   await sendTx(conn, payer, [
     unwrapBurnIx(ctx, vault, tokenAccount, receiptPda, receiptBump,
       balanceCt, amountCt, burnedCt, owner.publicKey, amount),
-  ], [owner]);
+  ], [owner, burnedKp]);
   await pollUntil(conn, balanceCt, isVerified, 120_000);
   await pollUntil(conn, burnedCt, isVerified, 120_000);
   ok("Burn committed");
@@ -116,7 +118,7 @@ async function main() {
   const [pcMint, pcMintBump] = deriveMintPda(TP, mintAuth.publicKey);
   await sendTx(conn, payer, [initializeMintIx(ctx, pcMint, pcMintBump, DECIMALS, mintAuth.publicKey)], [mintAuth]);
   const [vaultPda, vaultBump] = deriveVaultPda(TP, pcMint);
-  await sendTx(conn, payer, [initializeVaultIx(ctx, vaultPda, vaultBump, pcMint, usdcMint.publicKey)]);
+  await sendTx(conn, payer, [initializeVaultIx(ctx, vaultPda, vaultBump, pcMint, usdcMint.publicKey, mintAuth.publicKey)], [mintAuth]);
   const vaultAta = await createSplTokenAccount(conn, payer, usdcMint.publicKey, vaultPda);
   const [aliceCp, aliceBump] = deriveAccountPda(TP, pcMint, alice.publicKey);
   const aliceBal = Keypair.generate();
@@ -130,8 +132,10 @@ async function main() {
   ok("Setup complete");
 
   log("3/9", "Alice wraps 10 USDC → 10 pcUSDC...");
-  const wrapCt = await enc(grpc, USDC(10), nk);
-  await sendTx(conn, payer, [wrapIx(ctx, vaultPda, aliceCp, aliceAta.publicKey, vaultAta.publicKey, aliceBal.publicKey, wrapCt, alice.publicKey, USDC(10))], [alice]);
+  // Epoch 2: the wrap amount ciphertext is a fresh keypair the program creates
+  // from the SPL amount (no createInput).
+  const wrapKp = Keypair.generate();
+  await sendTx(conn, payer, [wrapIx(ctx, vaultPda, aliceCp, aliceAta.publicKey, vaultAta.publicKey, aliceBal.publicKey, wrapKp.publicKey, alice.publicKey, USDC(10))], [alice, wrapKp]);
   await pollUntil(conn, aliceBal.publicKey, isVerified, 120_000);
   ok("Wrapped"); val("Vault", `${Number(await readSplBalance(conn, vaultAta.publicKey))/1e6} USDC`);
 

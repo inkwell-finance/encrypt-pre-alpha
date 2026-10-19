@@ -77,7 +77,7 @@ fn transfer_receipt_graph(
 
 const PROGRAM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../../../target/deploy/pc_token.so"
+    "/../../../../../target/deploy-localnet/pc_token.so"
 );
 
 const SYSTEM_PROGRAM: Pubkey = Pubkey::new_from_array([0u8; 32]);
