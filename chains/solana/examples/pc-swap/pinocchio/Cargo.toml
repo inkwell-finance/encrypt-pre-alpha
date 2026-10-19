@@ -15,6 +15,8 @@ pinocchio-system = { workspace = true }
 
 [dev-dependencies]
 encrypt-solana-test = { workspace = true }
+# SolanaRuntime::send_transaction returns a Result (negative tests).
+encrypt-dev = { workspace = true }
 encrypt-types = { workspace = true }
 encrypt-dsl = { package = "encrypt-solana-dsl", path = "../../../program-sdk/dsl" }
 solana-sdk = { workspace = true }
@@ -23,9 +25,16 @@ solana-account = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-instruction = { workspace = true }
 
+# PDA derivation on the host (tests). On SBF it is a syscall.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+solana-address = { workspace = true }
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [features]
 default = []
 mock = []
+# Pin the Encrypt program id the encrypt-solana-test LiteSVM harness deploys
+# at (Cq37zH...). Default builds pin the devnet Encrypt program.
+localnet = []
